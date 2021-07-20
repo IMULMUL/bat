@@ -174,7 +174,7 @@ impl<'a> InteractivePrinter<'a> {
             let syntax = match assets.get_syntax(config.language, input, &config.syntax_mapping) {
                 Ok(syntax) => syntax,
                 Err(Error(ErrorKind::UndetectedSyntax(_), _)) => {
-                    assets.syntax_set.find_syntax_plain_text()
+                    assets.get_syntax_set().find_syntax_plain_text()
                 }
                 Err(e) => return Err(e),
             };
@@ -192,7 +192,7 @@ impl<'a> InteractivePrinter<'a> {
             #[cfg(feature = "git")]
             line_changes,
             highlighter,
-            syntax_set: &assets.syntax_set,
+            syntax_set: assets.get_syntax_set(),
             background_color_highlight,
         })
     }
@@ -447,8 +447,10 @@ impl<'a> Printer for InteractivePrinter<'a> {
 
                 if text.len() != text_trimmed.len() {
                     if let Some(background_color) = background_color {
-                        let mut ansi_style = Style::default();
-                        ansi_style.background = to_ansi_color(background_color, true_color);
+                        let ansi_style = Style {
+                            background: to_ansi_color(background_color, true_color),
+                            ..Default::default()
+                        };
                         let width = if cursor_total <= cursor_max {
                             cursor_max - cursor_total + 1
                         } else {
@@ -588,8 +590,10 @@ impl<'a> Printer for InteractivePrinter<'a> {
             }
 
             if let Some(background_color) = background_color {
-                let mut ansi_style = Style::default();
-                ansi_style.background = to_ansi_color(background_color, self.config.true_color);
+                let ansi_style = Style {
+                    background: to_ansi_color(background_color, self.config.true_color),
+                    ..Default::default()
+                };
 
                 write!(
                     handle,
