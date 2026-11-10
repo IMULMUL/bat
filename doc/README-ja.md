@@ -1,7 +1,6 @@
 <p align="center">
   <img src="logo-header.svg" alt="bat - a cat clone with wings"><br>
-  <a href="https://travis-ci.org/sharkdp/bat"><img src="https://travis-ci.org/sharkdp/bat.svg?branch=master" alt="Build Status"></a>
-  <a href="https://ci.appveyor.com/project/sharkdp/bat"><img src="https://ci.appveyor.com/api/projects/status/cptsmtbiwbnr2vhf?svg=true"></a>
+  <a href="https://github.com/sharkdp/bat/actions?query=workflow%3ACICD"><img src="https://github.com/sharkdp/bat/workflows/CICD/badge.svg" alt="Build Status"></a>
   <img src="https://img.shields.io/crates/l/bat.svg" alt="license">
   <a href="https://crates.io/crates/bat"><img src="https://img.shields.io/crates/v/bat.svg?colorB=319e8c" alt="Version info"></a><br>
   シンタックスハイライトとGitとの連携機能付きの <i>cat(1)</i> クローン。
@@ -12,8 +11,12 @@
   <a href="#使い方">使い方</a> •
   <a href="#インストール">インストール</a> •
   <a href="#カスタマイズ">カスタマイズ</a> •
-  <a href="#プロジェクトの目標と既存の類似したOSS">プロジェクトの目標と既存の類似したOSS</a> •
-  翻訳 [<a href="https://github.com/chinanf-boy/bat-zh">中文</a>][<a href="README-ja.md">日本語</a>][<a href="README-ko.md">한국어</a>]
+  <a href="#プロジェクトの目標と既存の類似したOSS">プロジェクトの目標と既存の類似したOSS</a><br>
+  [<a href="../README.md">English</a>]
+  [<a href="README-zh.md">中文</a>]
+  [日本語]
+  [<a href="README-ko.md">한국어</a>]
+  [<a href="README-ru.md">Русский</a>]
 </p>
 
 ### シンタックスハイライト
@@ -95,6 +98,17 @@ bat f - g  # output 'f', then stdin, then 'g'.
 
 ### 他のツールとの統合
 
+#### `fzf`
+
+[`fzf`](https://github.com/junegunn/fzf) のプレビューウィンドウに `bat` を使用できます。
+その場合、`bat` の `--color=always` オプションを用いてカラー出力を強制しなければなりません。
+また、`--line-range` オプションを用いることで巨大なファイルの読み込み時間を制限できます:
+```bash
+fzf --preview 'bat --color=always --style=numbers --line-range=:500 {}'
+```
+
+詳しくは [`fzf` の `README`](https://github.com/junegunn/fzf#preview-window) を参照してください。
+
 #### `find` or `fd`
 
 `find` の `-exec` オプションを使用して、`bat` ですべての検索結果をプレビューできます:
@@ -167,12 +181,12 @@ man 2 select
 
 ## インストール
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/bat.svg)](https://repology.org/project/bat/versions)
+[![Packaging status](https://repology.org/badge/vertical-allrepos/bat-cat.svg?columns=3&exclude_unsupported=1)](https://repology.org/project/bat-cat/versions)
 
 ###  On Ubuntu (`apt` を使用)
 *... や他のDebianベースのLinuxディストリビューション*
 
-Ubuntu Eoan 19.10 または Debian 不安定版 sid 以降の [the Ubuntu `bat` package](https://packages.ubuntu.com/eoan/bat) または [the Debian `bat` package](https://packages.debian.org/sid/bat) からインストールできます:
+[20.04 ("Focal") 以降の Ubuntu](https://packages.ubuntu.com/search?keywords=bat&exact=1) または [2021 年 8 月以降の Debian (Debian 11 - "Bullseye")](https://packages.debian.org/bullseye/bat) では `bat` パッケージが利用できます。
 
 ```bash
 apt install bat
@@ -191,7 +205,7 @@ ln -s /usr/bin/batcat ~/.local/bin/bat
 batの最新リリースを実行する場合、または Ubuntu/Debian の古いバージョンを使用している場合は、[release page](https://github.com/sharkdp/bat/releases) から最新の `.deb` パッケージをダウンロードし、
 次の方法でインストールします:
 ```bash
-sudo dpkg -i bat_0.18.0_amd64.deb  # adapt version number and architecture
+sudo dpkg -i bat_0.18.3_amd64.deb  # adapt version number and architecture
 ```
 
 ### On Alpine Linux
@@ -205,7 +219,7 @@ apk add bat
 
 ###  On Arch Linux
 
-[Arch Linuxの公式リソース](https://www.archlinux.org/packages/community/x86_64/bat/)
+[Arch Linuxの公式リソース](https://www.archlinux.org/packages/extra/x86_64/bat/)
 からインストールできます。
 
 ```bash
@@ -352,7 +366,7 @@ ansible-galaxy install aeimer.install_bat
 ### From source
 
 
-`bat` をソースからビルドしたいならば、Rust 1.36 以上の環境が必要です。
+`bat` をソースからビルドしたいならば、Rust 1.79.0 以上の環境が必要です。
 `cargo` を使用してビルドすることができます:
 
 ```bash
@@ -393,7 +407,7 @@ bat --list-themes | fzf --preview="bat --theme={} --color=always /path/to/file"
 
 ### 新しい構文の追加 / 言語の定義
 
-`bat` はシンタックスハイライトのための [`syntext`](https://github.com/trishume/syntect/)
+`bat` はシンタックスハイライトのための [`syntect`](https://github.com/trishume/syntect/)
 という素晴らしいライブラリを使用しています。`syntect` は、
 [Sublime Text の `.sublime-syntax` ファイル](https://www.sublimetext.com/docs/3/syntax.html)
 とテーマを読み取ることができます。新しい構文を定義するために以下の手順を行います。
@@ -511,7 +525,7 @@ export BAT_CONFIG_PATH="/path/to/bat.conf"
 # Use italic text on the terminal (not supported on all terminals)
 --italic-text=always
 
-# Use C++ syntax for .ino files
+# Use C++ syntax for Arduino .ino files
 --map-syntax "*.ino:C++"
 
 # Use ".gitignore"-style highlighting for ".ignore" files

@@ -1,210 +1,214 @@
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs;
 use std::path::Path;
 
-use syntect::dumps::{dump_to_file, from_binary, from_reader};
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet, SyntaxSetBuilder};
+use once_cell::unsync::OnceCell;
+
+use syntect::highlighting::Theme;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use path_abs::PathAbs;
 
-use crate::assets_metadata::AssetsMetadata;
-use crate::bat_warning;
 use crate::error::*;
-use crate::input::{InputReader, OpenedInput, OpenedInputKind};
-use crate::syntax_mapping::{MappingTarget, SyntaxMapping};
+use crate::input::{InputReader, OpenedInput};
+use crate::syntax_mapping::ignored_suffixes::IgnoredSuffixes;
+use crate::syntax_mapping::MappingTarget;
+use crate::theme::{default_theme, ColorScheme};
+use crate::{bat_warning, SyntaxMapping};
+
+use lazy_theme_set::LazyThemeSet;
+
+use serialized_syntax_set::*;
+
+#[cfg(feature = "build-assets")]
+pub use crate::assets::build_assets::*;
+
+pub(crate) mod assets_metadata;
+#[cfg(feature = "build-assets")]
+mod build_assets;
+mod lazy_theme_set;
+mod serialized_syntax_set;
 
 #[derive(Debug)]
 pub struct HighlightingAssets {
-    pub(crate) syntax_set: SyntaxSet,
-    pub(crate) theme_set: ThemeSet,
+    syntax_set_cell: OnceCell<SyntaxSet>,
+    serialized_syntax_set: SerializedSyntaxSet,
+
+    theme_set: LazyThemeSet,
     fallback_theme: Option<&'static str>,
 }
 
+#[derive(Debug)]
+pub struct SyntaxReferenceInSet<'a> {
+    pub syntax: &'a SyntaxReference,
+    pub syntax_set: &'a SyntaxSet,
+}
+
+/// Lazy-loaded syntaxes are already compressed, and we don't want to compress
+/// already compressed data.
+pub(crate) const COMPRESS_SYNTAXES: bool = false;
+
+/// We don't want to compress our [LazyThemeSet] since the lazy-loaded themes
+/// within it are already compressed, and compressing another time just makes
+/// performance suffer
+pub(crate) const COMPRESS_THEMES: bool = false;
+
+/// Compress for size of ~40 kB instead of ~200 kB without much difference in
+/// performance due to lazy-loading
+pub(crate) const COMPRESS_LAZY_THEMES: bool = true;
+
+/// Compress for size of ~10 kB instead of ~120 kB
+pub(crate) const COMPRESS_ACKNOWLEDGEMENTS: bool = true;
+
 impl HighlightingAssets {
-    pub fn default_theme() -> &'static str {
-        "Monokai Extended"
-    }
-
-    pub fn from_files(source_dir: &Path, include_integrated_assets: bool) -> Result<Self> {
-        let mut theme_set = if include_integrated_assets {
-            Self::get_integrated_themeset()
-        } else {
-            ThemeSet {
-                themes: BTreeMap::new(),
-            }
-        };
-
-        let theme_dir = source_dir.join("themes");
-        if theme_dir.exists() {
-            let res = theme_set.add_from_folder(&theme_dir);
-            if let Err(err) = res {
-                println!(
-                    "Failed to load one or more themes from '{}' (reason: '{}')",
-                    theme_dir.to_string_lossy(),
-                    err,
-                );
-            }
-        } else {
-            println!(
-                "No themes were found in '{}', using the default set",
-                theme_dir.to_string_lossy()
-            );
-        }
-
-        let mut syntax_set_builder = if !include_integrated_assets {
-            let mut builder = SyntaxSetBuilder::new();
-            builder.add_plain_text_syntax();
-            builder
-        } else {
-            Self::get_integrated_syntaxset().into_builder()
-        };
-
-        let syntax_dir = source_dir.join("syntaxes");
-        if syntax_dir.exists() {
-            syntax_set_builder.add_from_folder(syntax_dir, true)?;
-        } else {
-            println!(
-                "No syntaxes were found in '{}', using the default set.",
-                syntax_dir.to_string_lossy()
-            );
-        }
-
-        Ok(HighlightingAssets {
-            syntax_set: syntax_set_builder.build(),
+    fn new(serialized_syntax_set: SerializedSyntaxSet, theme_set: LazyThemeSet) -> Self {
+        HighlightingAssets {
+            syntax_set_cell: OnceCell::new(),
+            serialized_syntax_set,
             theme_set,
             fallback_theme: None,
-        })
+        }
     }
 
     pub fn from_cache(cache_path: &Path) -> Result<Self> {
-        let syntax_set_path = cache_path.join("syntaxes.bin");
-        let theme_set_path = cache_path.join("themes.bin");
-
-        let syntax_set_file = File::open(&syntax_set_path).chain_err(|| {
-            format!(
-                "Could not load cached syntax set '{}'",
-                syntax_set_path.to_string_lossy()
-            )
-        })?;
-        let syntax_set: SyntaxSet = from_reader(BufReader::new(syntax_set_file))
-            .chain_err(|| "Could not parse cached syntax set")?;
-
-        let theme_set_file = File::open(&theme_set_path).chain_err(|| {
-            format!(
-                "Could not load cached theme set '{}'",
-                theme_set_path.to_string_lossy()
-            )
-        })?;
-        let theme_set: ThemeSet = from_reader(BufReader::new(theme_set_file))
-            .chain_err(|| "Could not parse cached theme set")?;
-
-        Ok(HighlightingAssets {
-            syntax_set,
-            theme_set,
-            fallback_theme: None,
-        })
-    }
-
-    fn get_integrated_syntaxset() -> SyntaxSet {
-        from_binary(include_bytes!("../assets/syntaxes.bin"))
-    }
-
-    fn get_integrated_themeset() -> ThemeSet {
-        from_binary(include_bytes!("../assets/themes.bin"))
+        Ok(HighlightingAssets::new(
+            SerializedSyntaxSet::FromFile(cache_path.join("syntaxes.bin")),
+            asset_from_cache(&cache_path.join("themes.bin"), "theme set", COMPRESS_THEMES)?,
+        ))
     }
 
     pub fn from_binary() -> Self {
-        let syntax_set = Self::get_integrated_syntaxset();
-        let theme_set = Self::get_integrated_themeset();
-
-        HighlightingAssets {
-            syntax_set,
-            theme_set,
-            fallback_theme: None,
-        }
-    }
-
-    pub fn save_to_cache(&self, target_dir: &Path, current_version: &str) -> Result<()> {
-        let _ = fs::create_dir_all(target_dir);
-        let theme_set_path = target_dir.join("themes.bin");
-        let syntax_set_path = target_dir.join("syntaxes.bin");
-
-        print!(
-            "Writing theme set to {} ... ",
-            theme_set_path.to_string_lossy()
-        );
-        dump_to_file(&self.theme_set, &theme_set_path).chain_err(|| {
-            format!(
-                "Could not save theme set to {}",
-                theme_set_path.to_string_lossy()
-            )
-        })?;
-        println!("okay");
-
-        print!(
-            "Writing syntax set to {} ... ",
-            syntax_set_path.to_string_lossy()
-        );
-        dump_to_file(&self.syntax_set, &syntax_set_path).chain_err(|| {
-            format!(
-                "Could not save syntax set to {}",
-                syntax_set_path.to_string_lossy()
-            )
-        })?;
-        println!("okay");
-
-        print!(
-            "Writing metadata to folder {} ... ",
-            target_dir.to_string_lossy()
-        );
-        AssetsMetadata::new(current_version).save_to_folder(target_dir)?;
-        println!("okay");
-
-        Ok(())
+        HighlightingAssets::new(
+            SerializedSyntaxSet::FromBinary(get_serialized_integrated_syntaxset()),
+            get_integrated_themeset(),
+        )
     }
 
     pub fn set_fallback_theme(&mut self, theme: &'static str) {
         self.fallback_theme = Some(theme);
     }
 
+    /// Return the collection of syntect syntax definitions.
+    pub fn get_syntax_set(&self) -> Result<&SyntaxSet> {
+        self.syntax_set_cell
+            .get_or_try_init(|| self.serialized_syntax_set.deserialize())
+    }
+
+    /// Use [Self::get_syntaxes] instead
+    #[deprecated]
     pub fn syntaxes(&self) -> &[SyntaxReference] {
-        self.syntax_set.syntaxes()
+        self.get_syntax_set()
+            .expect(".syntaxes() is deprecated, use .get_syntaxes() instead")
+            .syntaxes()
+    }
+
+    pub fn get_syntaxes(&self) -> Result<&[SyntaxReference]> {
+        Ok(self.get_syntax_set()?.syntaxes())
+    }
+
+    fn get_theme_set(&self) -> &LazyThemeSet {
+        &self.theme_set
     }
 
     pub fn themes(&self) -> impl Iterator<Item = &str> {
-        self.theme_set.themes.keys().map(|s| s.as_ref())
+        self.get_theme_set().themes()
     }
 
+    /// Use [Self::get_syntax_for_path] instead
+    #[deprecated]
     pub fn syntax_for_file_name(
         &self,
         file_name: impl AsRef<Path>,
         mapping: &SyntaxMapping,
     ) -> Option<&SyntaxReference> {
-        let file_name = file_name.as_ref();
-        match mapping.get_syntax_for(file_name) {
-            Some(MappingTarget::MapToUnknown) => None,
-            Some(MappingTarget::MapTo(syntax_name)) => {
-                self.syntax_set.find_syntax_by_name(syntax_name)
-            }
-            None => self.get_extension_syntax(file_name.as_os_str()),
+        self.get_syntax_for_path(file_name, mapping)
+            .ok()
+            .map(|syntax_in_set| syntax_in_set.syntax)
+    }
+
+    /// Detect the syntax based on, in order:
+    ///  1. Syntax mappings with [MappingTarget::MapTo] and [MappingTarget::MapToUnknown]
+    ///     (e.g. `/etc/profile` -> `Bourne Again Shell (bash)`)
+    ///  2. The file name (e.g. `Dockerfile`)
+    ///  3. Syntax mappings with [MappingTarget::MapExtensionToUnknown]
+    ///     (e.g. `*.conf`)
+    ///  4. The file name extension (e.g. `.rs`)
+    ///
+    /// When detecting syntax based on syntax mappings, the full path is taken
+    /// into account. When detecting syntax based on file name, no regard is
+    /// taken to the path of the file. Only the file name itself matters. When
+    /// detecting syntax based on file name extension, only the file name
+    /// extension itself matters.
+    ///
+    /// Returns [Error::UndetectedSyntax] if it was not possible detect syntax
+    /// based on path/file name/extension (or if the path was mapped to
+    /// [MappingTarget::MapToUnknown] or [MappingTarget::MapExtensionToUnknown]).
+    /// In this case it is appropriate to fall back to other methods to detect
+    /// syntax. Such as using the contents of the first line of the file.
+    ///
+    /// Returns [Error::UnknownSyntax] if a syntax mapping exist, but the mapped
+    /// syntax does not exist.
+    pub fn get_syntax_for_path(
+        &self,
+        path: impl AsRef<Path>,
+        mapping: &SyntaxMapping,
+    ) -> Result<SyntaxReferenceInSet<'_>> {
+        let path = path.as_ref();
+
+        let syntax_match = mapping.get_syntax_for(path);
+
+        if let Some(MappingTarget::MapToUnknown) = syntax_match {
+            return Err(Error::UndetectedSyntax(
+                crate::preprocessor::sanitize_for_terminal(&path.to_string_lossy()),
+            ));
+        }
+
+        if let Some(MappingTarget::MapTo(syntax_name)) = syntax_match {
+            return self
+                .find_syntax_by_token(syntax_name)?
+                .ok_or_else(|| Error::UnknownSyntax(syntax_name.to_owned()));
+        }
+
+        let file_name = path.file_name().unwrap_or_default();
+
+        match (
+            self.get_syntax_for_file_name(file_name, &mapping.ignored_suffixes)?,
+            syntax_match,
+        ) {
+            (Some(syntax), _) => Ok(syntax),
+
+            (_, Some(MappingTarget::MapExtensionToUnknown)) => Err(Error::UndetectedSyntax(
+                crate::preprocessor::sanitize_for_terminal(&path.to_string_lossy()),
+            )),
+
+            _ => self
+                .get_syntax_for_file_extension(file_name, &mapping.ignored_suffixes)?
+                .ok_or_else(|| {
+                    Error::UndetectedSyntax(crate::preprocessor::sanitize_for_terminal(
+                        &path.to_string_lossy(),
+                    ))
+                }),
         }
     }
 
-    pub(crate) fn get_theme(&self, theme: &str) -> &Theme {
-        match self.theme_set.themes.get(theme) {
+    /// Look up a syntect theme by name.
+    pub fn get_theme(&self, theme: &str) -> &Theme {
+        match self.get_theme_set().get(theme) {
             Some(theme) => theme,
             None => {
                 if theme == "ansi-light" || theme == "ansi-dark" {
-                    bat_warning!("Theme '{}' is deprecated, using 'ansi' instead.", theme);
+                    bat_warning!("Theme '{theme}' is deprecated, using 'ansi' instead.");
                     return self.get_theme("ansi");
                 }
-                if theme != "" {
-                    bat_warning!("Unknown theme '{}', using default.", theme)
+                if !theme.is_empty() {
+                    bat_warning!("Unknown theme '{theme}', using default.")
                 }
-                &self.theme_set.themes[self.fallback_theme.unwrap_or_else(|| Self::default_theme())]
+                self.get_theme_set()
+                    .get(
+                        self.fallback_theme
+                            .unwrap_or_else(|| default_theme(ColorScheme::Dark)),
+                    )
+                    .expect("something is very wrong if the default theme is missing")
             }
         }
     }
@@ -212,81 +216,210 @@ impl HighlightingAssets {
     pub(crate) fn get_syntax(
         &self,
         language: Option<&str>,
+        fallback_syntax: Option<&str>,
         input: &mut OpenedInput,
         mapping: &SyntaxMapping,
-    ) -> Result<&SyntaxReference> {
+    ) -> Result<SyntaxReferenceInSet<'_>> {
         if let Some(language) = language {
-            self.syntax_set
+            let syntax_set = self.get_syntax_set()?;
+            return syntax_set
                 .find_syntax_by_token(language)
-                .ok_or_else(|| ErrorKind::UnknownSyntax(language.to_owned()).into())
-        } else {
-            let line_syntax = self.get_first_line_syntax(&mut input.reader);
+                .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set })
+                .ok_or_else(|| Error::UnknownSyntax(language.to_owned()));
+        }
 
-            // Get the path of the file:
-            // If this was set by the metadata, that will take priority.
-            // If it wasn't, it will use the real file path (if available).
-            let path_str =
-                input
-                    .metadata
-                    .user_provided_name
-                    .as_ref()
-                    .or_else(|| match input.kind {
-                        OpenedInputKind::OrdinaryFile(ref path) => Some(path),
-                        _ => None,
-                    });
+        let path = input.path();
+        let absolute_path = path.and_then(|p| {
+            PathAbs::new(p)
+                .ok()
+                .map(|abs| abs.as_path().to_path_buf())
+                .or_else(|| Some(p.to_owned()))
+        });
 
-            if let Some(path_str) = path_str {
-                // If a path was provided, we try and detect the syntax based on extension mappings.
-                let path = Path::new(path_str);
-                let absolute_path = PathAbs::new(path)
-                    .ok()
-                    .map(|p| p.as_path().to_path_buf())
-                    .unwrap_or_else(|| path.to_owned());
-
-                match mapping.get_syntax_for(absolute_path) {
-                    Some(MappingTarget::MapToUnknown) => line_syntax.ok_or_else(|| {
-                        ErrorKind::UndetectedSyntax(path.to_string_lossy().into()).into()
-                    }),
-
-                    Some(MappingTarget::MapTo(syntax_name)) => self
-                        .syntax_set
-                        .find_syntax_by_name(syntax_name)
-                        .ok_or_else(|| ErrorKind::UnknownSyntax(syntax_name.to_owned()).into()),
-
-                    None => {
-                        let file_name = path.file_name().unwrap_or_default();
-                        self.get_extension_syntax(file_name)
-                            .or(line_syntax)
-                            .ok_or_else(|| {
-                                ErrorKind::UndetectedSyntax(path.to_string_lossy().into()).into()
-                            })
+        let path_syntax = if let Some(ref path) = absolute_path {
+            self.get_syntax_for_path(path, mapping).or_else(|e| {
+                // If syntax detection failed on the given path, retry with the
+                // canonicalized path (which resolves symlinks). This handles
+                // cases like `Aliases/0install -> ../Formula/zero-install.rb`
+                // where the symlink name has no extension but the target does.
+                // See #1001.
+                if matches!(e, Error::UndetectedSyntax(_)) {
+                    if let Ok(resolved) = fs::canonicalize(path) {
+                        if resolved != *path {
+                            return match self.get_syntax_for_path(&resolved, mapping) {
+                                Ok(syntax) => Ok(syntax),
+                                Err(Error::UndetectedSyntax(_)) => Err(e),
+                                Err(err) => Err(err),
+                            };
+                        }
                     }
                 }
-            } else {
-                // If a path wasn't provided, we fall back to the detect first-line syntax.
-                line_syntax.ok_or_else(|| ErrorKind::UndetectedSyntax("[unknown]".into()).into())
+                Err(e)
+            })
+        } else {
+            Err(Error::UndetectedSyntax("[unknown]".into()))
+        };
+
+        // If a path wasn't provided, or if path based syntax detection
+        // above failed, we fall back to first-line syntax detection.
+        match path_syntax {
+            Err(Error::UndetectedSyntax(path)) => {
+                if let Some(syntax_in_set) = self.get_first_line_syntax(&mut input.reader)? {
+                    Ok(syntax_in_set)
+                } else if let Some(language) = fallback_syntax {
+                    self.find_syntax_by_token(language)?
+                        .ok_or_else(|| Error::UnknownSyntax(language.to_owned()))
+                } else {
+                    Err(Error::UndetectedSyntax(path))
+                }
             }
+            _ => path_syntax,
         }
     }
 
-    fn get_extension_syntax(&self, file_name: &OsStr) -> Option<&SyntaxReference> {
-        self.syntax_set
-            .find_syntax_by_extension(file_name.to_str().unwrap_or_default())
-            .or_else(|| {
-                self.syntax_set.find_syntax_by_extension(
-                    Path::new(file_name)
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or_default(),
-                )
-            })
+    pub(crate) fn find_syntax_by_name(
+        &self,
+        syntax_name: &str,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let syntax_set = self.get_syntax_set()?;
+        Ok(syntax_set
+            .find_syntax_by_name(syntax_name)
+            .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
     }
 
-    fn get_first_line_syntax(&self, reader: &mut InputReader) -> Option<&SyntaxReference> {
-        String::from_utf8(reader.first_line.clone())
-            .ok()
-            .and_then(|l| self.syntax_set.find_syntax_by_first_line(&l))
+    fn find_syntax_by_extension(
+        &self,
+        e: Option<&OsStr>,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let syntax_set = self.get_syntax_set()?;
+        let extension = e.and_then(|x| x.to_str()).unwrap_or_default();
+        Ok(syntax_set
+            .find_syntax_by_extension(extension)
+            .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
     }
+
+    fn find_syntax_by_hidden_file_name(
+        &self,
+        file_name: &OsStr,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let Some(hidden_file_extension) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix('.'))
+            .filter(|name| !name.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        // syntect stores `hidden_file_extensions` in the same extension list as
+        // regular file extensions, but dotfiles must be queried without the
+        // leading period.
+        self.find_syntax_by_extension(Some(OsStr::new(hidden_file_extension)))
+    }
+
+    fn find_syntax_by_token(&self, token: &str) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let syntax_set = self.get_syntax_set()?;
+        Ok(syntax_set
+            .find_syntax_by_token(token)
+            .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
+    }
+
+    fn get_syntax_for_file_name(
+        &self,
+        file_name: &OsStr,
+        ignored_suffixes: &IgnoredSuffixes,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let mut syntax = self.find_syntax_by_extension(Some(file_name))?;
+        if syntax.is_none() {
+            syntax = self.find_syntax_by_hidden_file_name(file_name)?;
+        }
+        if syntax.is_none() {
+            syntax =
+                ignored_suffixes.try_with_stripped_suffix(file_name, |stripped_file_name| {
+                    // Note: recursion
+                    self.get_syntax_for_file_name(stripped_file_name, ignored_suffixes)
+                })?;
+        }
+        Ok(syntax)
+    }
+
+    fn get_syntax_for_file_extension(
+        &self,
+        file_name: &OsStr,
+        ignored_suffixes: &IgnoredSuffixes,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let stripped =
+            ignored_suffixes.try_with_stripped_suffix(file_name, |stripped_file_name| {
+                self.get_syntax_for_file_extension(stripped_file_name, ignored_suffixes)
+                    .map(Some)
+            })?;
+        match stripped {
+            Some(syntax) => Ok(syntax),
+            None => self.find_syntax_by_extension(Path::new(file_name).extension()),
+        }
+    }
+
+    fn get_first_line_syntax(
+        &self,
+        reader: &mut InputReader,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let syntax_set = self.get_syntax_set()?;
+        Ok(std::str::from_utf8(&reader.first_line)
+            .ok()
+            .and_then(|l| {
+                // Strip UTF-8 BOM if present
+                let line = l.strip_prefix('\u{feff}').unwrap_or(l);
+                syntax_set.find_syntax_by_first_line(line)
+            })
+            .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
+    }
+}
+
+pub(crate) fn get_serialized_integrated_syntaxset() -> &'static [u8] {
+    include_bytes!("../assets/syntaxes.bin")
+}
+
+pub(crate) fn get_integrated_themeset() -> LazyThemeSet {
+    from_binary(include_bytes!("../assets/themes.bin"), COMPRESS_THEMES)
+}
+
+pub fn get_acknowledgements() -> String {
+    from_binary(
+        include_bytes!("../assets/acknowledgements.bin"),
+        COMPRESS_ACKNOWLEDGEMENTS,
+    )
+}
+
+pub(crate) fn from_binary<T: serde::de::DeserializeOwned>(v: &[u8], compressed: bool) -> T {
+    asset_from_contents(v, "n/a", compressed)
+        .expect("data integrated in binary is never faulty, but make sure `compressed` is in sync!")
+}
+
+fn asset_from_contents<T: serde::de::DeserializeOwned>(
+    contents: &[u8],
+    description: &str,
+    compressed: bool,
+) -> Result<T> {
+    if compressed {
+        bincode::deserialize_from(flate2::read::ZlibDecoder::new(contents))
+    } else {
+        bincode::deserialize_from(contents)
+    }
+    .map_err(|_| format!("Could not parse {description}").into())
+}
+
+fn asset_from_cache<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    description: &str,
+    compressed: bool,
+) -> Result<T> {
+    let contents = fs::read(path).map_err(|_| {
+        format!(
+            "Could not load cached {description} '{}'",
+            path.to_string_lossy()
+        )
+    })?;
+    asset_from_contents(&contents[..], description, compressed)
+        .map_err(|_| format!("Could not parse cached {description}").into())
 }
 
 #[cfg(test)]
@@ -296,7 +429,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{BufReader, Write};
     use tempfile::TempDir;
 
     use crate::input::Input;
@@ -307,13 +440,26 @@ mod tests {
         pub temp_dir: TempDir,
     }
 
-    impl<'a> SyntaxDetectionTest<'a> {
+    impl SyntaxDetectionTest<'_> {
         fn new() -> Self {
             SyntaxDetectionTest {
                 assets: HighlightingAssets::from_binary(),
-                syntax_mapping: SyntaxMapping::builtin(),
+                syntax_mapping: SyntaxMapping::new(),
                 temp_dir: TempDir::new().expect("creation of temporary directory"),
             }
+        }
+
+        fn get_syntax_name(
+            &self,
+            language: Option<&str>,
+            fallback_syntax: Option<&str>,
+            input: &mut OpenedInput,
+            mapping: &SyntaxMapping,
+        ) -> String {
+            self.assets
+                .get_syntax(language, fallback_syntax, input, mapping)
+                .map(|syntax_in_set| syntax_in_set.syntax.name.clone())
+                .unwrap_or_else(|_| "!no syntax!".to_owned())
         }
 
         fn syntax_for_real_file_with_content_os(
@@ -324,18 +470,14 @@ mod tests {
             let file_path = self.temp_dir.path().join(file_name);
             {
                 let mut temp_file = File::create(&file_path).unwrap();
-                writeln!(temp_file, "{}", first_line).unwrap();
+                writeln!(temp_file, "{first_line}").unwrap();
             }
 
             let input = Input::ordinary_file(&file_path);
             let dummy_stdin: &[u8] = &[];
             let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
-            self.assets
-                .get_syntax(None, &mut opened_input, &self.syntax_mapping)
-                .unwrap_or_else(|_| self.assets.syntax_set.find_syntax_plain_text())
-                .name
-                .clone()
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         fn syntax_for_file_with_content_os(&self, file_name: &OsStr, first_line: &str) -> String {
@@ -345,11 +487,7 @@ mod tests {
             let dummy_stdin: &[u8] = &[];
             let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
-            self.assets
-                .get_syntax(None, &mut opened_input, &self.syntax_mapping)
-                .unwrap_or_else(|_| self.assets.syntax_set.find_syntax_plain_text())
-                .name
-                .clone()
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         #[cfg(unix)]
@@ -369,11 +507,7 @@ mod tests {
             let input = Input::stdin().with_name(Some(file_name));
             let mut opened_input = input.open(content, None).unwrap();
 
-            self.assets
-                .get_syntax(None, &mut opened_input, &self.syntax_mapping)
-                .unwrap_or_else(|_| self.assets.syntax_set.find_syntax_plain_text())
-                .name
-                .clone()
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         fn syntax_is_same_for_inputkinds(&self, file_name: &str, content: &str) -> bool {
@@ -384,8 +518,7 @@ mod tests {
 
             if !consistent {
                 eprintln!(
-                    "Inconsistent syntax detection:\nFor File: {}\nFor Reader: {}",
-                    as_file, as_reader
+                    "Inconsistent syntax detection:\nFor File: {as_file}\nFor Reader: {as_reader}"
                 )
             }
 
@@ -472,6 +605,41 @@ mod tests {
     }
 
     #[test]
+    fn syntax_detection_first_line_with_utf8_bom() {
+        let test = SyntaxDetectionTest::new();
+
+        // Test that XML files are detected correctly even with UTF-8 BOM
+        // The BOM should be stripped before first-line syntax detection
+        let xml_with_bom = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_file", xml_with_bom),
+            "XML"
+        );
+
+        // Test the specific .csproj case mentioned in the issue
+        // Even if .csproj has extension mapping, this tests first-line fallback
+        let csproj_content_with_bom = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Project ToolsVersion=\"15.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">";
+        assert_eq!(
+            test.syntax_for_file_with_content("test.csproj", csproj_content_with_bom),
+            "XML"
+        );
+
+        // Test that shell scripts are detected correctly even with UTF-8 BOM
+        let script_with_bom = "\u{feff}#!/bin/bash";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_script", script_with_bom),
+            "Bourne Again Shell (bash)"
+        );
+
+        // Test that PHP files are detected correctly even with UTF-8 BOM
+        let php_with_bom = "\u{feff}<?php";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_php", php_with_bom),
+            "PHP"
+        );
+    }
+
+    #[test]
     fn syntax_detection_with_custom_mapping() {
         let mut test = SyntaxDetectionTest::new();
 
@@ -483,13 +651,100 @@ mod tests {
     }
 
     #[test]
-    fn syntax_detection_is_case_sensitive() {
+    fn syntax_detection_with_extension_mapping_to_unknown() {
         let mut test = SyntaxDetectionTest::new();
 
-        assert_ne!(test.syntax_for_file("README.MD"), "Markdown");
+        // Normally, a CMakeLists.txt file shall use the CMake syntax, even if it is
+        // a bash script in disguise
+        assert_eq!(
+            test.syntax_for_file_with_content("CMakeLists.txt", "#!/bin/bash"),
+            "CMake"
+        );
+
+        // Other .txt files shall use the Plain Text syntax
+        assert_eq!(
+            test.syntax_for_file_with_content("some-other.txt", "#!/bin/bash"),
+            "Plain Text"
+        );
+
+        // If we setup MapExtensionToUnknown on *.txt, the match on the full
+        // file name of "CMakeLists.txt" shall have higher prio, and CMake shall
+        // still be used for it
+        test.syntax_mapping
+            .insert("*.txt", MappingTarget::MapExtensionToUnknown)
+            .ok();
+        assert_eq!(
+            test.syntax_for_file_with_content("CMakeLists.txt", "#!/bin/bash"),
+            "CMake"
+        );
+
+        // However, for *other* files with a .txt extension, first-line fallback
+        // shall now be used
+        assert_eq!(
+            test.syntax_for_file_with_content("some-other.txt", "#!/bin/bash"),
+            "Bourne Again Shell (bash)"
+        );
+    }
+
+    #[test]
+    fn syntax_detection_ignored_suffix_falls_back_to_first_line() {
+        let mut test = SyntaxDetectionTest::new();
+
+        // By default a `.txt` file uses Plain Text, even with a shebang: the
+        // `.txt` extension wins and first-line detection is not reached.
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "#!/usr/bin/env bash"),
+            "Plain Text"
+        );
+
+        // Once `.txt` is an ignored suffix it is stripped before detection. The
+        // stripped name (`test`) has no extension, so detection falls back to the
+        // first line -- even though `.txt` is itself a registered extension that
+        // would otherwise match as Plain Text. See #2745.
+        test.syntax_mapping.insert_ignored_suffix(".txt");
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "#!/usr/bin/env bash"),
+            "Bourne Again Shell (bash)"
+        );
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "<?php"),
+            "PHP"
+        );
+
+        // A `.txt` file without a recognizable first line keeps no syntax (the
+        // caller renders it as plain text); we must not resurrect the shadowed
+        // `.txt` -> Plain Text match here.
+        assert_eq!(
+            test.syntax_for_file_with_content("notes.txt", "just some prose"),
+            "!no syntax!"
+        );
+
+        // Stripping that exposes a real extension still works: `.dev` is ignored,
+        // and the remaining `.json` extension is detected as usual.
+        test.syntax_mapping.insert_ignored_suffix(".dev");
+        assert_eq!(
+            test.syntax_for_file_with_content("config.json.dev", ""),
+            "JSON"
+        );
+    }
+
+    #[test]
+    fn syntax_detection_is_case_insensitive() {
+        let mut test = SyntaxDetectionTest::new();
+
+        assert_eq!(test.syntax_for_file("README.md"), "Markdown");
+        assert_eq!(test.syntax_for_file("README.mD"), "Markdown");
+        assert_eq!(test.syntax_for_file("README.Md"), "Markdown");
+        assert_eq!(test.syntax_for_file("README.MD"), "Markdown");
+
+        // Adding a mapping for "MD" in addition to "md" should not break the mapping
         test.syntax_mapping
             .insert("*.MD", MappingTarget::MapTo("Markdown"))
             .ok();
+
+        assert_eq!(test.syntax_for_file("README.md"), "Markdown");
+        assert_eq!(test.syntax_for_file("README.mD"), "Markdown");
+        assert_eq!(test.syntax_for_file("README.Md"), "Markdown");
         assert_eq!(test.syntax_for_file("README.MD"), "Markdown");
     }
 
@@ -504,6 +759,55 @@ mod tests {
             test.syntax_for_stdin_with_content("my_script", b"#!/bin/bash"),
             "Bourne Again Shell (bash)"
         );
+    }
+
+    #[cfg(feature = "build-assets")]
+    #[test]
+    fn syntax_detection_hidden_file_extensions() {
+        let source_dir = TempDir::new().expect("creation of temporary source directory");
+        let cache_dir = TempDir::new().expect("creation of temporary cache directory");
+        let syntax_dir = source_dir.path().join("syntaxes");
+
+        std::fs::create_dir_all(&syntax_dir).expect("creation of syntax directory succeeds");
+        std::fs::write(
+            syntax_dir.join("HiddenFileExtension.sublime-syntax"),
+            r#"%YAML 1.2
+---
+name: Hidden File Extension
+hidden_file_extensions:
+  - testrc
+scope: source.hiddenfileextension
+
+contexts:
+  main:
+    - match: .
+      scope: source.hiddenfileextension
+"#,
+        )
+        .expect("custom syntax can be written");
+
+        build(
+            source_dir.path(),
+            false,
+            false,
+            cache_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("custom assets can be built");
+
+        let test = SyntaxDetectionTest {
+            assets: HighlightingAssets::from_cache(cache_dir.path())
+                .expect("custom syntax cache can be loaded"),
+            syntax_mapping: SyntaxMapping::new(),
+            temp_dir: TempDir::new().expect("creation of temporary directory"),
+        };
+
+        assert_eq!(test.syntax_for_file(".testrc"), "Hidden File Extension");
+        assert_eq!(
+            test.syntax_for_stdin_with_content(".testrc", b""),
+            "Hidden File Extension"
+        );
+        assert!(test.syntax_is_same_for_inputkinds(".testrc", ""));
     }
 
     #[cfg(unix)]
@@ -527,11 +831,35 @@ mod tests {
         let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
         assert_eq!(
-            test.assets
-                .get_syntax(None, &mut opened_input, &test.syntax_mapping)
-                .unwrap_or_else(|_| test.assets.syntax_set.find_syntax_plain_text())
-                .name,
+            test.get_syntax_name(None, None, &mut opened_input, &test.syntax_mapping),
             "SSH Config"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn syntax_detection_for_symlinked_file_by_target_extension() {
+        use std::os::unix::fs::symlink;
+
+        let test = SyntaxDetectionTest::new();
+
+        let formula_dir = test.temp_dir.path().join("Formula");
+        std::fs::create_dir(&formula_dir).unwrap();
+        let target = formula_dir.join("zero-install.rb");
+        File::create(&target).unwrap();
+
+        let aliases_dir = test.temp_dir.path().join("Aliases");
+        std::fs::create_dir(&aliases_dir).unwrap();
+        let link = aliases_dir.join("0install");
+        symlink(&target, &link).unwrap();
+
+        let input = Input::ordinary_file(&link);
+        let dummy_stdin: &[u8] = &[];
+        let mut opened_input = input.open(dummy_stdin, None).unwrap();
+
+        assert_eq!(
+            test.get_syntax_name(None, None, &mut opened_input, &test.syntax_mapping),
+            "Ruby"
         );
     }
 }

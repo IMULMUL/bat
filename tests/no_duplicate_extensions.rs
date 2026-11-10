@@ -26,12 +26,11 @@ fn no_duplicate_extensions() {
 
     let mut extensions = HashSet::new();
 
-    for syntax in assets.syntaxes() {
+    for syntax in assets.get_syntaxes().expect("this is a #[test]") {
         for extension in &syntax.file_extensions {
             assert!(
                 KNOWN_EXCEPTIONS.contains(&extension.as_str()) || extensions.insert(extension),
-                "File extension / pattern \"{}\" appears twice in the syntax set",
-                extension
+                "File extension / pattern \"{extension}\" appears twice in the syntax set"
             );
         }
     }
